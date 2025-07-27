@@ -5,6 +5,7 @@ import io
 import time
 import re
 import requests
+import feedparser
 
 from flask import Flask
 from bs4 import BeautifulSoup
@@ -48,58 +49,47 @@ def fetch_page_with_selenium(url, wait: float = 2.0) -> str:
     return driver.page_source
 
 def extract_size(text):
-    match = re.search(r"(\d+(?:\.\d+)?\s*(?:GB|MB|KB))", text, re.IGNORECASE)
+    match = re.search(r"Size:\s*(\d+(?:\.\d+)?\s*(?:GB|MB|KB))", text, re.IGNORECASE)
     return match.group(1) if match else "Unknown"
 
-def crawl_tbl():
-    base_url = "https://www.1tamilblasters.moi"
+def crawl_torlock():
+    rss_url = "https://www.torlock.com/movies/rss.xml"
     torrents = []
 
     try:
-        html = fetch_page_with_selenium(base_url)
-        soup = BeautifulSoup(html, "html.parser")
-
-        topic_links = [
-            a["href"] for a in soup.find_all("a", href=re.compile(r'/forums/topic/'))
-            if a.get("href")
-        ]
-
-        for rel_url in list(dict.fromkeys(topic_links))[:15]:
-            full_url = rel_url if rel_url.startswith("http") else base_url + rel_url
+        # Parse the RSS feed
+        feed = feedparser.parse(rss_url)
+        
+        for entry in feed.entries[:15]:  # Limit to 15 most recent entries
             try:
-                topic_html = fetch_page_with_selenium(full_url)
-                post_soup = BeautifulSoup(topic_html, "html.parser")
-
-                torrent_tags = post_soup.find_all("a", attrs={"data-fileext": "torrent"})
-                file_links = []
-                for tag in torrent_tags:
-                    href = tag.get("href")
-                    if not href:
-                        continue
-                    raw_text = tag.get_text(strip=True)
-                    title = raw_text.replace("www.1TamilBlasters.red - ", "")\
-                                    .rstrip(".torrent").strip()
-                    size = extract_size(raw_text)
-                    file_links.append({
-                        "type": "torrent",
-                        "title": title,
-                        "link": href.strip(),
-                        "size": size
-                    })
-
-                if file_links:
+                # Get the torrent page URL from the guid
+                torrent_page_url = entry.guid
+                
+                # Fetch the torrent page with Selenium
+                page_html = fetch_page_with_selenium(torrent_page_url)
+                page_soup = BeautifulSoup(page_html, "html.parser")
+                
+                # Find the download button and extract the torrent URL
+                download_div = page_soup.find("div", class_="col-md-4 col-sm-4", style="text-align:center")
+                if download_div:
+                    torrent_url = download_div.find("a")["href"]
+                    
+                    # Extract title and size from the RSS entry
+                    title = entry.title
+                    size = extract_size(entry.description)
+                    
                     torrents.append({
-                        "topic_url": full_url,
-                        "title": file_links[0]["title"],
-                        "size": file_links[0]["size"],
-                        "links": file_links
+                        "title": title,
+                        "size": size,
+                        "torrent_url": torrent_url,
+                        "page_url": torrent_page_url
                     })
-
+                    
             except Exception as post_err:
-                logging.error(f"Failed to parse TBL topic {rel_url}: {post_err}")
+                logging.error(f"Failed to parse Torlock page {entry.guid}: {post_err}")
 
     except Exception as e:
-        logging.error(f"Failed to fetch TBL homepage: {e}")
+        logging.error(f"Failed to fetch Torlock RSS feed: {e}")
 
     return torrents
 
@@ -117,7 +107,7 @@ class MN_Bot(Client):
         )
         self.channel_id = CHANNEL.ID
         self.last_posted = set()
-        self.seen_topics = set()
+        self.seen_torrents = set()
 
     async def safe_send_message(self, chat_id, text, **kwargs):
         for chunk in (text[i:i+self.MAX_MSG_LENGTH] for i in range(0, len(text), self.MAX_MSG_LENGTH)):
@@ -127,45 +117,40 @@ class MN_Bot(Client):
     async def auto_post_torrents(self):
         while True:
             try:
-                torrents = crawl_tbl()
+                torrents = crawl_torlock()
                 for t in torrents:
-                    topic = t["topic_url"]
-                    new_files = [f for f in t["links"] if f["link"] not in self.last_posted]
-                    if topic in self.seen_topics and not new_files:
+                    if t["torrent_url"] in self.last_posted:
                         continue
 
-                    # grab current Selenium cookies & UA for downloads
-                    selenium_cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                    selenium_ua = driver.execute_script("return navigator.userAgent;")
-                    headers = {"User-Agent": selenium_ua}
-
-                    for file in new_files:
-                        try:
-                            resp = requests.get(file["link"],
-                                                cookies=selenium_cookies,
-                                                headers=headers,
-                                                timeout=10)
-                            resp.raise_for_status()
-                            file_bytes = io.BytesIO(resp.content)
-                            filename = file["title"].replace(" ", "_") + ".torrent"
-                            caption = (
-                                f"{file['title']}\n"
-                                f"📦 {file['size']}\n"
-                                "#tbl torrent file"
-                            )
-                            await self.send_document(
-                                self.channel_id,
-                                file_bytes,
-                                file_name=filename,
-                                caption=caption
-                            )
-                            self.last_posted.add(file["link"])
-                            logging.info(f"Posted TBL: {file['title']}")
-                            await asyncio.sleep(3)
-                        except Exception as e:
-                            logging.error(f"Error sending TBL file {file['link']}: {e}")
-
-                    self.seen_topics.add(topic)
+                    try:
+                        # Download the torrent file
+                        resp = requests.get(t["torrent_url"], timeout=10)
+                        resp.raise_for_status()
+                        file_bytes = io.BytesIO(resp.content)
+                        filename = t["title"].replace(" ", "_") + ".torrent"
+                        
+                        # Create caption
+                        caption = (
+                            f"{t['title']}\n"
+                            f"📦 {t['size']}\n"
+                            f"🔗 [Source]({t['page_url']})\n"
+                            "#torlock #torrent"
+                        )
+                        
+                        # Send to channel
+                        await self.send_document(
+                            self.channel_id,
+                            file_bytes,
+                            file_name=filename,
+                            caption=caption
+                        )
+                        
+                        self.last_posted.add(t["torrent_url"])
+                        logging.info(f"Posted Torlock: {t['title']}")
+                        await asyncio.sleep(3)
+                        
+                    except Exception as e:
+                        logging.error(f"Error sending Torlock file {t['torrent_url']}: {e}")
 
             except Exception as e:
                 logging.error(f"Error in auto_post_torrents: {e}")
@@ -178,9 +163,9 @@ class MN_Bot(Client):
         BOT.USERNAME = f"@{me.username}"
         await self.send_message(
             OWNER.ID,
-            text=f"{me.first_name} ✅ BOT started with Selenium‑backed TBL support"
+            text=f"{me.first_name} ✅ BOT started with Torlock support"
         )
-        logging.info("MN‑Bot started with Selenium‑TBL support")
+        logging.info("MN‑Bot started with Torlock support")
         asyncio.create_task(self.auto_post_torrents())
 
     async def stop(self, *args):
