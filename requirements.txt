@@ -1,5 +1,5 @@
 aiohttp
-pyrofork==2.3.4
+pyrofork==2.3.69.dev1
 python-dotenv
 TgCrypto
 feedparser
